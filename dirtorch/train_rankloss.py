@@ -1,6 +1,7 @@
 import os
 import torch
 import numpy as np
+import tensorwatch as tw
 import dirtorch.nets as nets
 from datetime import datetime
 import torch.nn.functional as F
@@ -12,7 +13,7 @@ from dirtorch.utils.common import tonumpy, pool
 from dirtorch.utils.pytorch_loader import get_loader
 from dirtorch.test_dir import eval_model,extract_image_features,expand_descriptors
 from tensorboardX import SummaryWriter
-
+model_options = {'arch': 'resnet50_fpn_rmac', 'out_dim': 2048, 'pooling': 'gem', 'gemp': 3}
 class ClassLoss(torch.nn.Module):
 
     def __init__(self):
@@ -51,6 +52,7 @@ def train_model(db,test_db, net, criterion, trfs, pooling='mean', gemp=3, detail
             rank_loss = criterion(scores, Y)
             rank_loss.backward()
             optimizer.zero_grad()
+            # print('\nscores',scores.cpu().detach().numpy()[:5,:5],'\ndesc_db',desc_db.cpu().detach().numpy()[:5,:5],'\ndesc_db.grad',desc_db.grad.cpu().detach().numpy()[:5,:5])
             for i,img in enumerate(imgs):
                 img = Variable(img.cuda(),requires_grad=True)
                 desc = net(img.unsqueeze(dim=0))
@@ -61,7 +63,7 @@ def train_model(db,test_db, net, criterion, trfs, pooling='mean', gemp=3, detail
             lr = scheduler_mul.get_lr()[0]
             epoch_loss+=(rank_loss.item()+cls_losses/len(desc_db))
         print(time_now() + '\n[Train Phase][Epoch: %3d/%3d][Batch:%3d][Loss: %3.5f][lr:%.5f]' % (epoch + 1, epochs,index+1, epoch_loss / len(loader), lr))
-        writer.add_scalars(os.path.join(output,'log','Train_val_loss') , {output+ 'train_loss': epoch_loss / len(loader)},epoch)
+        writer.add_scalars(os.path.join(output,'log','Train_val_loss') , {output+ 'train_loss': epoch_loss / len(loader)},epoch+1)
 
         fconv = open(os.path.join(output,'log', 'convergence.csv'), 'a')
         if (epoch + 1) % 5 == 0:
@@ -78,6 +80,9 @@ def train_model(db,test_db, net, criterion, trfs, pooling='mean', gemp=3, detail
                              save_feats='./experiments/feats/', load_feats=None,epoch=epoch)
             print(' * ' + '\n * '.join(['%s = %g' % p for p in res.items()]))
             fconv.write('{},{},{},{}\n'.format(epoch+1,lr, epoch_loss / len(loader),res))
+            writer.add_scalars(os.path.join(output, 'log', 'top3MAP'),
+                               {output + 'top3MAP': res['top3']}, epoch)
+
         else:
             fconv.write('{},{},{}\n'.format(epoch+1, lr, epoch_loss / len(loader)))
 
@@ -86,7 +91,7 @@ def train_model(db,test_db, net, criterion, trfs, pooling='mean', gemp=3, detail
 
 def load_model(path=None, iscuda=''):
     checkpoint = common.load_checkpoint('./pretrained_model/Resnet50-AP-GeM.pt', iscuda)
-    net = nets.create_model(pretrained="", **checkpoint['model_options'])
+    net = nets.create_model(pretrained="", **model_options)#**checkpoint['model_options']
     net = common.switch_model_to_cuda(net, iscuda, checkpoint)
     if path:
         checkpoint_2 = common.load_checkpoint(path, iscuda)
@@ -95,13 +100,20 @@ def load_model(path=None, iscuda=''):
     else:
         checkpoint_state_dict = checkpoint['state_dict']
         start_epoch = 0
-    net.load_state_dict(checkpoint_state_dict,False)
+    # net.load_state_dict(checkpoint_state_dict,False)
+    load_param(net,checkpoint_state_dict)
     net.preprocess = checkpoint.get('preprocess', net.preprocess)
     if 'pca' in checkpoint:
         net.pca = checkpoint.get('pca')
 
     return net,start_epoch
 
+def load_param(model,checkpoint_state_dict):
+    model_pretrained = checkpoint_state_dict
+    model_dict = model.state_dict()
+    pretrained_dict = {k: v for k, v in model_pretrained.items() if (k in model_dict) and (v.shape==model_dict[k].shape)}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
 
 if __name__ == '__main__':
     import argparse
@@ -136,8 +148,8 @@ if __name__ == '__main__':
 
 
     parser.add_argument('--batch_size', type=int, default=320, help='size of batch imags')
-    parser.add_argument('--epochs', type=int, default=1000, help='train epochs')
-    parser.add_argument('--saved', type=str, default='./experiments/ICIAIR+cls_loss/', help='train epochs')
+    parser.add_argument('--epochs', type=int, default=300, help='train epochs')
+    parser.add_argument('--saved', type=str, default='./experiments/ICIAR+no_pretrained/', help='train epochs')
 
     args = parser.parse_args()
     gpu_ids = args.gpu[0].split(',')
@@ -154,7 +166,8 @@ if __name__ == '__main__':
 
     #load model
     print("With %s Train Model:" %(args.dataset))
-    net,start_epoch = load_model(args.checkpoint, args.iscuda)
+    net, start_epoch = load_model(args.checkpoint, args.iscuda)
+    net.cuda()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     net = torch.nn.DataParallel(net,device_ids = [0])
     net.to(device)
@@ -164,8 +177,8 @@ if __name__ == '__main__':
     net.preprocess = net.module.preprocess
     net.iscuda = net.module.iscuda
     criterion = APLoss()
-    optimizer = torch.optim.SGD(net.parameters(), lr=1*1e-2, weight_decay=1e-4)
-    scheduler_mul = torch.optim.lr_scheduler.MultiStepLR(optimizer,list( np.arange(int(start_epoch)+100, int(args.epochs), 100)),0.9)
+    optimizer = torch.optim.SGD(net.parameters(), lr=5*1e-3, weight_decay=1e-4)
+    scheduler_mul = torch.optim.lr_scheduler.MultiStepLR(optimizer, list(np.arange(int(start_epoch)+50, int(args.epochs), 100)),0.9)
     writer = SummaryWriter(os.path.join(args.saved,'log'))
     #whiten and pca
     if args.whiten:
